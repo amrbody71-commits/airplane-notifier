@@ -40,6 +40,15 @@ LOOKAHEAD_MARGIN = timedelta(minutes=30)
 # so restarting the app cannot replay meetings that already began.
 DEFAULT_LEAD_MINUTES = [5]
 
+# A lead of exactly 0 means "at the event's start", not "before it" -- Maghrib
+# starting is itself the moment worth announcing. Polling every 30s means the
+# tick that notices "delay is now <= 0" typically lands a few seconds to a
+# minute after the real start, so this is how far past start the alert may
+# still fire and be honestly called "just started" rather than stale. Kept
+# short and deliberately separate from LOOKAHEAD_MARGIN / ALERT_WINDOW, which
+# both look forward in time, not back.
+START_GRACE = timedelta(seconds=90)
+
 BASE_BACKOFF = timedelta(seconds=30)
 MAX_BACKOFF = timedelta(minutes=5)
 # 30s * 2**4 = 480s, already past MAX_BACKOFF, so nothing beyond this changes
@@ -157,12 +166,20 @@ class CalendarClient:
         newly_alerted = False
         for parsed in self._events:
             delay = parsed["start"] - moment
-            if delay < timedelta(0):
-                continue
             # Shortest matching lead wins, so a 30-minute warning is not
-            # announced as the 60-minute one when both windows are open.
+            # announced as the 60-minute one when both windows are open. Lead
+            # 0 sorts first and is evaluated against its own window below,
+            # since "at start" and "N minutes before" open at opposite ends
+            # of `delay`'s sign.
             for lead in sorted(parsed["leads"]):
-                if delay > timedelta(minutes=lead):
+                if lead == 0:
+                    # "Just started": delay is at or slightly past zero, not
+                    # still positive (that is what leads > 0 are for) and not
+                    # so far negative that the event has been running a while.
+                    in_window = -START_GRACE <= delay <= timedelta(0)
+                else:
+                    in_window = timedelta(0) <= delay <= timedelta(minutes=lead)
+                if not in_window:
                     continue
                 # The lead is part of the key: an hour-before and a
                 # half-hour-before alert for the same event are separate.
@@ -302,7 +319,13 @@ class CalendarClient:
 
         if not isinstance(chosen, list):
             chosen = [chosen]
-        minutes = sorted({as_int(v, 0) for v in chosen} - {0}, reverse=True)
+        # -1 is a sentinel meaning "as_int could not parse this", not a real
+        # lead value, so it is filtered out below along with any (equally
+        # nonsensical) negative lead a user might type by hand. 0 is a real,
+        # meaningful value here -- "alert at the event's start" -- and must
+        # survive this filter rather than being treated as a parse failure.
+        candidates = {as_int(v, -1) for v in chosen}
+        minutes = sorted((m for m in candidates if m >= 0), reverse=True)
         return minutes or list(DEFAULT_LEAD_MINUTES)
 
     @staticmethod

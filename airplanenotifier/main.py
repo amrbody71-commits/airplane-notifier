@@ -43,10 +43,14 @@ def _banner_text(meeting: dict) -> str:
 
     A calendar with several lead times flies more than one plane for the same
     event, so the banner names how far off it is -- otherwise the second plane
-    looks like a duplicate of the first.
+    looks like a duplicate of the first. Lead 0 is a different kind of plane
+    entirely -- not a warning that something is coming, but an announcement
+    that it has -- so it gets its own wording rather than "in 0 min".
     """
     title = meeting.get("summary", "")
     lead = meeting.get("lead_minutes", 5)
+    if lead == 0:
+        return f"{title} started"
     if lead <= 5:
         return title
     if lead % 60 == 0:

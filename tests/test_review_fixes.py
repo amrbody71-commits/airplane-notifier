@@ -586,9 +586,22 @@ def test_lead_times_match_a_calendar_id_too(config_dir):
 
 
 def test_a_nonsense_lead_time_falls_back_to_the_default(config_dir):
+    """'soon' has no valid entries left once dropped, so it uses the default.
+
+    Distinct from ['soon', 0] (tested elsewhere): 0 is itself a valid lead --
+    it is 'soon' alone that is nonsense here.
+    """
     cals = [{"id": "lse@import", "summary": "lse"}]
-    client, _ = _lead_client({"lse": ["soon", 0]}, cals, {"lse@import": [_event_in(4)]})
+    client, _ = _lead_client({"lse": ["soon"]}, cals, {"lse@import": [_event_in(4)]})
     assert [m["lead_minutes"] for m in client.get_upcoming_meetings(now=NOW)] == [5]
+
+
+def test_an_invalid_entry_alongside_a_valid_zero_keeps_the_zero(config_dir):
+    """The invalid entry is dropped; 0 is not swept away along with it."""
+    cals = [{"id": "lse@import", "summary": "lse"}]
+    client, _ = _lead_client({"lse": ["soon", 0]}, cals, {})
+    cfg = json.loads(paths.CONFIG_PATH.read_text())
+    assert client._lead_times_for(cfg, "lse@import", "lse") == [0]
 
 
 def test_the_banner_names_how_far_ahead_a_long_lead_is():
@@ -597,4 +610,111 @@ def test_the_banner_names_how_far_ahead_a_long_lead_is():
 
     assert _banner_text({"summary": "Lecture", "lead_minutes": 60}) == "in 1 hour - Lecture"
     assert _banner_text({"summary": "Lecture", "lead_minutes": 30}) == "in 30 min - Lecture"
+    assert _banner_text({"summary": "Standup", "lead_minutes": 5}) == "Standup"
+
+
+# --- lead 0: "at start", not "before" ----------------------------------------
+
+
+def test_lead_zero_survives_the_lead_time_filter(config_dir):
+    """0 used to be treated as a parse failure and silently dropped."""
+    paths.CONFIG_PATH.write_text(json.dumps(
+        {"lead_times": {"default": [5], "by_calendar": {"prayer": [10, 0]}}}))
+    client, _ = _client_with_calendars([{"id": "prayer", "summary": "prayer"}])
+    cfg = json.loads(paths.CONFIG_PATH.read_text())
+    assert client._lead_times_for(cfg, "prayer", "prayer") == [10, 0]
+
+
+def test_an_invalid_lead_is_dropped_not_confused_with_zero(config_dir):
+    """A typo ('10m') must not silently become an at-start alert."""
+    paths.CONFIG_PATH.write_text(json.dumps(
+        {"lead_times": {"default": [5], "by_calendar": {"prayer": ["10m"]}}}))
+    client, _ = _client_with_calendars([{"id": "prayer", "summary": "prayer"}])
+    cfg = json.loads(paths.CONFIG_PATH.read_text())
+    assert client._lead_times_for(cfg, "prayer", "prayer") == [5]  # falls back
+
+
+def test_a_hand_typed_negative_lead_is_dropped(config_dir):
+    client, _ = _client_with_calendars([{"id": "prayer", "summary": "prayer"}])
+    cfg = {"lead_times": {"default": [5], "by_calendar": {"prayer": [-5, 10]}}}
+    assert client._lead_times_for(cfg, "prayer", "prayer") == [10]
+
+
+def test_a_started_event_fires_within_the_grace_window(config_dir):
+    cals = [{"id": "prayer", "summary": "prayer"}]
+    client, _ = _lead_client({"prayer": [0]}, cals,
+                             {"prayer": [_event_in(-1, "maghrib", "Maghrib")]})
+    due = client.get_upcoming_meetings(now=NOW)
+    assert len(due) == 1
+    assert due[0]["lead_minutes"] == 0
+    assert due[0]["summary"] == "Maghrib"  # raw title; "started" is a display concern
+
+
+def test_a_started_event_does_not_fire_once_grace_has_passed(config_dir):
+    """An event that has been running for a while must not look 'just started'."""
+    cals = [{"id": "prayer", "summary": "prayer"}]
+    client, _ = _lead_client({"prayer": [0]}, cals,
+                             {"prayer": [_event_in(-10, "maghrib", "Maghrib")]})
+    assert client.get_upcoming_meetings(now=NOW) == []
+
+
+def test_the_at_start_alert_fires_only_once(config_dir):
+    cals = [{"id": "prayer", "summary": "prayer"}]
+    client, _ = _lead_client({"prayer": [0]}, cals,
+                             {"prayer": [_event_in(-1, "maghrib", "Maghrib")]})
+    client.get_upcoming_meetings(now=NOW)
+    again = client.get_upcoming_meetings(now=NOW + timedelta(seconds=20))
+    assert again == []
+
+
+def test_a_started_alert_survives_a_restart_without_replaying(config_dir):
+    """The exact class of bug fixed for advance alerts earlier today -- an
+    in-memory-only alerted set would double-fire this on every restart inside
+    the one-minute grace window."""
+    cals = [{"id": "prayer", "summary": "prayer"}]
+    events = {"prayer": [_event_in(-1, "maghrib", "Maghrib")]}
+    first, _ = _lead_client({"prayer": [0]}, cals, events)
+    assert len(first.get_upcoming_meetings(now=NOW)) == 1
+
+    second, _ = _client_with_calendars(cals, events)  # fresh instance, same config dir
+    assert second.get_upcoming_meetings(now=NOW + timedelta(seconds=10)) == []
+
+
+def test_advance_and_at_start_leads_both_fire_independently(config_dir):
+    """PrayerCal's actual configuration: [10, 0]. Both must eventually fire,
+    at their own separate moments, for the same event.
+
+    The event's start is fixed once, at NOW+9min; what changes between the
+    two calls is only `now`, exactly like two real 30s-apart sync ticks would.
+    """
+    cals = [{"id": "prayer", "summary": "prayer"}]
+    events_by_cal = {"prayer": [_event_in(9, "maghrib", "Maghrib")]}
+    client, _ = _lead_client({"prayer": [10, 0]}, cals, events_by_cal)
+
+    ten_min = client.get_upcoming_meetings(now=NOW)
+    assert [m["lead_minutes"] for m in ten_min] == [10]
+
+    # Ten minutes on, that same event (still starting at NOW+9min) now
+    # started a minute ago -- inside the at-start grace window.
+    at_start = client.get_upcoming_meetings(now=NOW + timedelta(minutes=10))
+    assert [m["lead_minutes"] for m in at_start] == [0]
+
+
+def test_a_calendar_without_lead_zero_configured_is_unaffected(config_dir):
+    """The other calendar stays the same: no [..., 0] means no at-start alert,
+    even for an event that has just started."""
+    cals = [{"id": "other", "summary": "other"}]
+    client, _ = _client_with_calendars(cals, {"other": [_event_in(-1, "x", "Something")]})
+    assert client.get_upcoming_meetings(now=NOW) == []  # default [5] never matches a past start
+
+
+def test_the_banner_announces_that_the_event_started():
+    from airplanenotifier.main import _banner_text
+
+    assert _banner_text({"summary": "Maghrib", "lead_minutes": 0}) == "Maghrib started"
+
+
+def test_the_five_minute_default_banner_is_unaffected_by_the_zero_case():
+    from airplanenotifier.main import _banner_text
+
     assert _banner_text({"summary": "Standup", "lead_minutes": 5}) == "Standup"
