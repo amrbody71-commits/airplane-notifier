@@ -511,9 +511,9 @@ def test_the_alerted_list_is_pruned_so_it_cannot_grow_forever(config_dir):
 
     old = (NOW - timedelta(days=2)).isoformat()
     recent = (NOW - timedelta(minutes=5)).isoformat()
-    cfg.save_alerted({("old-event", old), ("recent-event", recent)}, now=NOW)
+    cfg.save_alerted({("old-event", old, "5"), ("recent-event", recent, "5")}, now=NOW)
 
-    kept = {event_id for event_id, _ in cfg.load_alerted()}
+    kept = {entry[0] for entry in cfg.load_alerted()}
     assert kept == {"recent-event"}
 
 
@@ -523,3 +523,78 @@ def test_a_corrupt_alerted_file_is_not_fatal(config_dir):
 
     pth.ALERTED_PATH.write_text("{not json")
     assert cfg.load_alerted() == set()
+
+
+# --- per-calendar lead times -------------------------------------------------
+
+
+def _lead_client(by_calendar, calendars, events):
+    """A client whose config gives `by_calendar` lead times."""
+    paths.CONFIG_PATH.write_text(json.dumps(
+        {"lead_times": {"default": [5], "by_calendar": by_calendar}}))
+    return _client_with_calendars(calendars, events)
+
+
+def _event_in(minutes, event_id="lecture", summary="Lecture"):
+    start = NOW + timedelta(minutes=minutes)
+    return {
+        "id": event_id, "summary": summary, "status": "confirmed",
+        "start": {"dateTime": start.isoformat()},
+        "end": {"dateTime": (start + timedelta(hours=1)).isoformat()},
+    }
+
+
+def test_a_calendar_can_warn_an_hour_and_a_half_hour_ahead(config_dir):
+    """Two alerts for one event, at different distances."""
+    cals = [{"id": "lse@import", "summary": "https://ical.studenthub.lse.ac.uk/x.ics"}]
+    client, _ = _lead_client({"studenthub.lse.ac.uk": [60, 30]}, cals,
+                             {"lse@import": [_event_in(58)]})
+
+    first = client.get_upcoming_meetings(now=NOW)
+    assert [m["lead_minutes"] for m in first] == [60]
+
+    # Nothing more until the 30-minute mark, then a second, distinct alert.
+    assert client.get_upcoming_meetings(now=NOW + timedelta(minutes=10)) == []
+    second = client.get_upcoming_meetings(now=NOW + timedelta(minutes=29))
+    assert [m["lead_minutes"] for m in second] == [30]
+
+
+def test_each_lead_fires_only_once(config_dir):
+    cals = [{"id": "lse@import", "summary": "lse"}]
+    client, _ = _lead_client({"lse": [60, 30]}, cals, {"lse@import": [_event_in(58)]})
+    client.get_upcoming_meetings(now=NOW)
+    client.get_upcoming_meetings(now=NOW + timedelta(minutes=29))
+    for extra in (30, 40, 50, 55):
+        assert client.get_upcoming_meetings(now=NOW + timedelta(minutes=extra)) == []
+
+
+def test_other_calendars_keep_the_default_five_minutes(config_dir):
+    cals = [{"id": "lse@import", "summary": "lse"},
+            {"id": "primary", "summary": "me@example.com"}]
+    client, _ = _lead_client({"lse": [60, 30]}, cals,
+                             {"primary": [_event_in(45, "mine", "My thing")]})
+
+    assert client.get_upcoming_meetings(now=NOW) == []          # 45 min out
+    due = client.get_upcoming_meetings(now=NOW + timedelta(minutes=41))
+    assert [m["lead_minutes"] for m in due] == [5]
+
+
+def test_lead_times_match_a_calendar_id_too(config_dir):
+    cals = [{"id": "lse@import", "summary": "something else"}]
+    client, _ = _lead_client({"lse@import": [60]}, cals, {"lse@import": [_event_in(58)]})
+    assert [m["lead_minutes"] for m in client.get_upcoming_meetings(now=NOW)] == [60]
+
+
+def test_a_nonsense_lead_time_falls_back_to_the_default(config_dir):
+    cals = [{"id": "lse@import", "summary": "lse"}]
+    client, _ = _lead_client({"lse": ["soon", 0]}, cals, {"lse@import": [_event_in(4)]})
+    assert [m["lead_minutes"] for m in client.get_upcoming_meetings(now=NOW)] == [5]
+
+
+def test_the_banner_names_how_far_ahead_a_long_lead_is():
+    """Two planes for one event look like a bug unless they say which is which."""
+    from airplanenotifier.main import _banner_text
+
+    assert _banner_text({"summary": "Lecture", "lead_minutes": 60}) == "in 1 hour - Lecture"
+    assert _banner_text({"summary": "Lecture", "lead_minutes": 30}) == "in 30 min - Lecture"
+    assert _banner_text({"summary": "Standup", "lead_minutes": 5}) == "Standup"

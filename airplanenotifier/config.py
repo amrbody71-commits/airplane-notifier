@@ -46,6 +46,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Calendars to skip, by name or id. Holiday feeds and empty imports cost a
     # request every cycle and can never produce an alert.
     "ignored_calendars": [],
+    # Minutes before an event to fly the plane. A calendar may have several,
+    # so a lecture can warn you an hour ahead and again half an hour later.
+    # Keys match a calendar's id, its exact name, or any substring of its name
+    # -- imported feeds are often named after their raw URL.
+    "lead_times": {
+        "default": [5],
+        "by_calendar": {},
+    },
     # How late a fixed-time nudge may still fire if the machine was off or
     # locked at the appointed hour. Past this it waits for tomorrow, so a
     # laptop opened at 20:00 is not asked about lunch.
@@ -272,22 +280,30 @@ def load_alerted() -> set:
         return set()
     if not isinstance(raw, list):
         return set()
-    return {
-        (str(item[0]), str(item[1]))
-        for item in raw
-        if isinstance(item, (list, tuple)) and len(item) == 2
-    }
+    restored = set()
+    for item in raw:
+        if not isinstance(item, (list, tuple)):
+            continue
+        if len(item) == 3:
+            restored.add((str(item[0]), str(item[1]), str(item[2])))
+        elif len(item) == 2:
+            # Written before lead times existed; treat as the old 5-minute one
+            # so an upgrade does not replay yesterday's alerts.
+            restored.add((str(item[0]), str(item[1]), "5"))
+    return restored
 
 
 def save_alerted(pairs, now: Optional[datetime] = None) -> None:
     """Write the alerted set, dropping entries too old to matter."""
     moment = now or datetime.now().astimezone()
     keep = []
-    for event_id, start_iso in pairs:
+    for entry in pairs:
+        event_id, start_iso = entry[0], entry[1]
+        lead = entry[2] if len(entry) > 2 else "5"
         started = parse_iso8601(start_iso, assume_utc=True)
         if started is not None and moment - started > ALERTED_RETENTION:
             continue
-        keep.append([event_id, start_iso])
+        keep.append([event_id, start_iso, lead])
 
     tmp = paths.ALERTED_PATH.with_suffix(".json.tmp")
     try:

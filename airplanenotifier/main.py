@@ -37,6 +37,25 @@ AUTH_RETRY_MS = 60_000
 WALKER_ASSETS = {"water": "walker_water.png", "food": "walker_food.png"}
 
 
+def _banner_text(meeting: dict) -> str:
+    """What the towed banner says.
+
+    A calendar with several lead times flies more than one plane for the same
+    event, so the banner names how far off it is -- otherwise the second plane
+    looks like a duplicate of the first.
+    """
+    title = meeting.get("summary", "")
+    lead = meeting.get("lead_minutes", 5)
+    if lead <= 5:
+        return title
+    if lead % 60 == 0:
+        hours = lead // 60
+        ahead = "1 hour" if hours == 1 else f"{hours} hours"
+    else:
+        ahead = f"{lead} min"
+    return f"in {ahead} - {title}"
+
+
 def _run_off_thread(work: Callable[[], object], done: Callable[[object], None],
                     failed: Callable[[Exception], None]) -> None:
     """Run `work` on a daemon thread, reporting back through callables.
@@ -211,7 +230,7 @@ class NotifierApp(QObject):
         meeting = self._pending_meetings.pop(0)
         cfg = config.load_config()
         overlay = OverlayWindow(
-            meeting.get("summary", ""),
+            _banner_text(meeting),
             asset_path("airplane.png"),
             speed_px_per_sec=config.as_int(cfg.get("flyover_speed"), 190),
         )

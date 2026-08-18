@@ -24,6 +24,7 @@ from typing import Any, Optional
 from googleapiclient.discovery import build
 
 from airplanenotifier import config
+from airplanenotifier.config import as_int
 from airplanenotifier.timeutil import parse_iso8601
 from airplanenotifier.log import diagnostic
 
@@ -31,9 +32,13 @@ from airplanenotifier.log import diagnostic
 # has something to answer with between alerts.
 LOOKAHEAD = timedelta(hours=2)
 
-# A meeting alerts once it is this close. Bounded at both ends, so restarting
-# the app cannot replay meetings that already began.
-ALERT_WINDOW = timedelta(minutes=5)
+# The query window must reach past the longest lead time, or an event would
+# not even be visible by the time it should have been announced.
+LOOKAHEAD_MARGIN = timedelta(minutes=30)
+
+# Fallback when config supplies nothing. Each alert is bounded at both ends,
+# so restarting the app cannot replay meetings that already began.
+DEFAULT_LEAD_MINUTES = [5]
 
 BASE_BACKOFF = timedelta(seconds=30)
 MAX_BACKOFF = timedelta(minutes=5)
@@ -74,6 +79,7 @@ class CalendarClient:
         self._last_sync: Optional[datetime] = None
         self._backoff_until: Optional[datetime] = None
         self._consecutive_failures = 0
+        self._calendar_names: dict[str, str] = {}
         self._calendar_ids_cache: Optional[list[str]] = None
         self._calendar_list_fetched: Optional[datetime] = None
 
@@ -118,20 +124,27 @@ class CalendarClient:
             return []
 
         try:
+            cfg = config.load_config()
             items = []
             for calendar_id in self._calendar_ids(moment):
+                leads = self._lead_times_for(
+                    cfg, calendar_id, self._calendar_names.get(calendar_id, "")
+                )
+                horizon = max(LOOKAHEAD, timedelta(minutes=leads[0]) + LOOKAHEAD_MARGIN)
                 response = (
                     self._service.events()
                     .list(
                         calendarId=calendar_id,
                         timeMin=self._rfc3339(moment),
-                        timeMax=self._rfc3339(moment + LOOKAHEAD),
+                        timeMax=self._rfc3339(moment + horizon),
                         singleEvents=True,
                         orderBy="startTime",
                     )
                     .execute()
                 )
-                items.extend(response.get("items", []))
+                for item in response.get("items", []):
+                    item["_leads"] = leads
+                    items.append(item)
         except Exception as exc:  # noqa: BLE001 - any failure must back off, not crash
             self._register_failure(self._completed(now), exc)
             return []
@@ -143,16 +156,27 @@ class CalendarClient:
         newly_alerted = False
         for parsed in self._events:
             delay = parsed["start"] - moment
-            if not timedelta(0) <= delay <= ALERT_WINDOW:
+            if delay < timedelta(0):
                 continue
-            key = (parsed["id"], parsed["start"].isoformat())
-            if key in self._alerted:
-                continue
-            self._alerted.add(key)
-            newly_alerted = True
-            due.append(
-                {"id": parsed["id"], "summary": parsed["summary"], "start_time": parsed["start"]}
-            )
+            # Shortest matching lead wins, so a 30-minute warning is not
+            # announced as the 60-minute one when both windows are open.
+            for lead in sorted(parsed["leads"]):
+                if delay > timedelta(minutes=lead):
+                    continue
+                # The lead is part of the key: an hour-before and a
+                # half-hour-before alert for the same event are separate.
+                key = (parsed["id"], parsed["start"].isoformat(), str(lead))
+                if key in self._alerted:
+                    break
+                self._alerted.add(key)
+                newly_alerted = True
+                due.append({
+                    "id": parsed["id"],
+                    "summary": parsed["summary"],
+                    "start_time": parsed["start"],
+                    "lead_minutes": lead,
+                })
+                break
         if newly_alerted:
             config.save_alerted(self._alerted, moment)
         return due
@@ -194,6 +218,9 @@ class CalendarClient:
             if str(name).strip()
         }
         ids = []
+        self._calendar_names = {
+            e["id"]: str(e.get("summary") or "") for e in entries if e.get("id")
+        }
         for entry in entries:
             calendar_id = entry.get("id")
             if not calendar_id or entry.get("deleted"):
@@ -211,6 +238,35 @@ class CalendarClient:
     @staticmethod
     def _rfc3339(moment: datetime) -> str:
         return moment.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _lead_times_for(self, cfg: dict, calendar_id: str, calendar_name: str) -> list[int]:
+        """Minutes-before values for one calendar, longest first.
+
+        Matching is deliberately forgiving: an imported feed is often named
+        after its raw .ics URL, so an exact name is impractical to type.
+        """
+        section = cfg.get("lead_times")
+        if not isinstance(section, dict):
+            return list(DEFAULT_LEAD_MINUTES)
+
+        by_calendar = section.get("by_calendar")
+        chosen = None
+        if isinstance(by_calendar, dict):
+            name = (calendar_name or "").casefold()
+            for key, leads in by_calendar.items():
+                probe = str(key).strip().casefold()
+                if not probe:
+                    continue
+                if probe == calendar_id.casefold() or probe == name or probe in name:
+                    chosen = leads
+                    break
+        if chosen is None:
+            chosen = section.get("default", DEFAULT_LEAD_MINUTES)
+
+        if not isinstance(chosen, list):
+            chosen = [chosen]
+        minutes = sorted({as_int(v, 0) for v in chosen} - {0}, reverse=True)
+        return minutes or list(DEFAULT_LEAD_MINUTES)
 
     @staticmethod
     def _parse_events(items: list[dict]) -> list[dict]:
@@ -243,6 +299,7 @@ class CalendarClient:
                     "summary": item.get("summary") or NO_TITLE,
                     "start": start,
                     "end": end,
+                    "leads": item.get("_leads") or list(DEFAULT_LEAD_MINUTES),
                 }
             )
         return parsed
