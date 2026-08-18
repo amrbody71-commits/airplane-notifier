@@ -80,6 +80,7 @@ class CalendarClient:
         self._backoff_until: Optional[datetime] = None
         self._consecutive_failures = 0
         self._calendar_names: dict[str, str] = {}
+        self._last_unmatched: list[str] = []
         self._calendar_ids_cache: Optional[list[str]] = None
         self._calendar_list_fetched: Optional[datetime] = None
 
@@ -221,6 +222,7 @@ class CalendarClient:
         self._calendar_names = {
             e["id"]: str(e.get("summary") or "") for e in entries if e.get("id")
         }
+        self._warn_unmatched_rules(entries)
         for entry in entries:
             calendar_id = entry.get("id")
             if not calendar_id or entry.get("deleted"):
@@ -238,6 +240,41 @@ class CalendarClient:
     @staticmethod
     def _rfc3339(moment: datetime) -> str:
         return moment.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _warn_unmatched_rules(self, entries: list[dict]) -> None:
+        """Log any config rule that matches no calendar.
+
+        Rules may name a calendar rather than its id, so renaming one in Google
+        Calendar quietly turns its rule into a no-op. Saying so is the
+        difference between a five-second fix and wondering for a week why the
+        lecture reminders stopped.
+        """
+        cfg = config.load_config()
+        known = set()
+        for entry in entries:
+            if entry.get("id"):
+                known.add(str(entry["id"]).casefold())
+            if entry.get("summary"):
+                known.add(str(entry["summary"]).strip().casefold())
+
+        def matches(probe: str) -> bool:
+            probe = probe.strip().casefold()
+            return bool(probe) and any(probe == k or probe in k for k in known)
+
+        rules = list(cfg.get("ignored_calendars") or [])
+        section = cfg.get("lead_times")
+        if isinstance(section, dict) and isinstance(section.get("by_calendar"), dict):
+            rules += list(section["by_calendar"])
+
+        unmatched = [str(r) for r in rules if not matches(str(r))]
+        if unmatched != self._last_unmatched:
+            for rule in unmatched:
+                print(
+                    f"airplane-notifier: config rule {rule!r} matches no calendar "
+                    f"(renamed or removed?)",
+                    file=diagnostic,
+                )
+            self._last_unmatched = unmatched
 
     def _lead_times_for(self, cfg: dict, calendar_id: str, calendar_name: str) -> list[int]:
         """Minutes-before values for one calendar, longest first.
