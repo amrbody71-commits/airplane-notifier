@@ -14,6 +14,7 @@ Qt signal, which Qt delivers on the main thread.
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 from typing import Callable, Optional
@@ -275,8 +276,37 @@ class NotifierApp(QObject):
         )
 
 
+def _acquire_single_instance() -> bool:
+    """Hold a named mutex for the process lifetime; False when one exists.
+
+    A watchdog task re-launches the app if it dies, and the auto-start Run key
+    launches it at login. Both firing must be harmless: without this guard two
+    instances each poll the calendar with separate in-memory dedup, so every
+    meeting flies two planes.
+    """
+    if sys.platform != "win32":
+        return True
+    import ctypes
+
+    ctypes.windll.kernel32.CreateMutexW(None, False, "AirplaneNotifierSingleInstance")
+    already_running = ctypes.windll.kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
+    return not already_running
+
+
 def main() -> int:
     make_stdout_safe()
+    if not _acquire_single_instance():
+        # Perfectly normal: the watchdog fired while the app was healthy.
+        return 0
+
+    # A clean start previously logged nothing at all, which made "did it even
+    # launch after the reboot?" unanswerable. One line settles it.
+    from airplanenotifier.log import get_logger
+
+    get_logger().info(
+        "started (pid %s, frozen=%s)", os.getpid(), bool(getattr(sys, "frozen", False))
+    )
+
     app = QApplication(sys.argv)
     notifier = NotifierApp(app)
     notifier.start()
