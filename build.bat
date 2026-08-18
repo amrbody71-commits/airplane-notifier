@@ -37,10 +37,15 @@ if errorlevel 1 goto :failed
 echo.
 echo === Build complete ===
 echo Output: dist\airplane-notifier\airplane-notifier.exe
+echo           dist\airplane-notifier\airplane-notifier-watchdog.exe
 echo.
 echo Before running it, copy your credentials.json into
 echo   dist\airplane-notifier\
 echo It is not bundled, so the OAuth client secret stays out of the build.
+echo.
+echo To make crashes and killed processes self-heal within seconds instead
+echo of staying broken until the next reboot, run:
+echo   install-watchdog.ps1
 echo.
 goto :done
 

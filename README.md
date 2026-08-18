@@ -136,6 +136,34 @@ appearance is appended to `~/.airplane-notifier/nudge-log.jsonl`:
 Run it for a few days, read the log, and set intervals from what actually
 happened rather than from what seemed reasonable up front.
 
+## Staying alive
+
+A registry Run key and a login-triggered task both fire exactly once, with no
+retry -- if that single launch fails, or the process dies hours later (a
+crash, a killed process, an unhandled exception), nothing else is watching.
+That gap cost a real user two missed meeting alerts after a reboot.
+
+`install-watchdog.ps1` closes it. It registers a second, near-dependency-free
+executable (`airplane-notifier-watchdog.exe`, built alongside the main one
+and sharing its dist folder) that loops every ~10 seconds checking whether
+the main app is alive via its single-instance mutex, and relaunches it the
+moment it isn't. A second scheduled-task trigger, once a minute, restarts the
+watchdog itself in the rare case that it -- not the main app -- is what died;
+its own mutex makes this a no-op almost every time.
+
+```powershell
+.\install-watchdog.ps1
+```
+
+Measured on this build: a killed main app was back in **0.6 seconds**.
+Killing *both* the app and the watchdog simultaneously -- the actual worst
+case this defends against -- self-healed in **28.5 seconds**, unattended.
+
+No user-mode software can promise literally zero possible downtime (a full
+system crash or a disabled Task Scheduler service is always outside its
+reach), but a normal crash or kill is now invisible in practice rather than
+silent until the next reboot.
+
 ## Diagnostics
 
 `~/.airplane-notifier/airplane-notifier.log` (rotating, 512 KB × 3).
@@ -150,7 +178,7 @@ file is the only place errors surface, so check it first if alerts stop.
 .venv\Scripts\python -m pytest
 ```
 
-218 tests. Qt tests run against the offscreen platform plugin and need no
+233 tests. Qt tests run against the offscreen platform plugin and need no
 display. `tools/smoke_run.py` boots the whole application headlessly.
 
 ## Building a standalone .exe

@@ -9,11 +9,19 @@ exe alongside its DLLs is handled far better (KTD5).
 OAuth client secret to anyone holding a copy of the build (plan review item 7).
 The app looks for it next to the exe instead, so it is dropped in after the
 build and can be replaced without rebuilding.
+
+Builds TWO executables into one shared dist folder: the main app, and a
+watchdog that relaunches it if it ever stops running (crash, kill, a login
+launch that silently failed). The watchdog gets its own `Analysis` rather
+than reusing the main one -- its whole dependency graph is stdlib plus this
+package's own log/paths modules, neither of which imports PyQt6 or the
+Google client, so analysing it separately keeps it from dragging ~100 MB of
+unrelated libraries into a process whose only job is watching a mutex.
 """
 
 block_cipher = None
 
-a = Analysis(
+a_main = Analysis(
     ['airplanenotifier/__main__.py'],
     pathex=[],
     binaries=[],
@@ -55,13 +63,40 @@ def _keep_datum(entry):
     return destination.endswith('/calendar.v3.json')
 
 
-a.datas = [entry for entry in a.datas if _keep_datum(entry)]
+a_main.datas = [entry for entry in a_main.datas if _keep_datum(entry)]
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+a_watchdog = Analysis(
+    ['airplanenotifier/watchdog.py'],
+    pathex=[],
+    binaries=[],
+    datas=[],
+    hiddenimports=[],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[
+        # None of these are ever imported by watchdog.py or its own imports
+        # (log.py, paths.py); excluding them is belt-and-braces against
+        # PyInstaller's hooks pulling in more than the script actually needs.
+        'PIL',
+        'pytest',
+        'tkinter',
+        'PyQt6',
+        'google',
+        'googleapiclient',
+        'google_auth_oauthlib',
+    ],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=block_cipher,
+    noarchive=False,
+)
 
-exe = EXE(
-    pyz,
-    a.scripts,
+pyz_main = PYZ(a_main.pure, a_main.zipped_data, cipher=block_cipher)
+
+exe_main = EXE(
+    pyz_main,
+    a_main.scripts,
     [],
     exclude_binaries=True,
     name='airplane-notifier',
@@ -79,11 +114,35 @@ exe = EXE(
     entitlements_file=None,
 )
 
+pyz_watchdog = PYZ(a_watchdog.pure, a_watchdog.zipped_data, cipher=block_cipher)
+
+exe_watchdog = EXE(
+    pyz_watchdog,
+    a_watchdog.scripts,
+    [],
+    exclude_binaries=True,
+    name='airplane-notifier-watchdog',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=False,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)
+
 coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
+    exe_main,
+    a_main.binaries,
+    a_main.zipfiles,
+    a_main.datas,
+    exe_watchdog,
+    a_watchdog.binaries,
+    a_watchdog.zipfiles,
+    a_watchdog.datas,
     strip=False,
     upx=False,
     upx_exclude=[],
