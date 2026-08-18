@@ -1,0 +1,24 @@
+# Secrets -- never commit these
+credentials.json
+token.json
+
+# Runtime state (lives in ~/.airplane-notifier, but just in case)
+state.json
+alerted.json
+nudge-log.jsonl
+*.log
+
+# Build output
+dist/
+build/
+build_venv/
+*.egg-info/
+
+# Environments
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/

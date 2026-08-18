@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "airplane-notifier"
+version = "0.1.0"
+description = "Windows tray app that flies an airplane across the screen before a meeting, and walks a character in to ask if you ate or drank water."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    # Upper bound is deliberate. PyQt6 6.8+ ships a Qt built against a newer
+    # MSVC runtime than this machine has, and QtCore fails to load with
+    # "DLL load failed ... The specified procedure could not be found."
+    # 6.7.x is the newest that imports cleanly here. Raise the ceiling only
+    # after confirming QtCore imports on the target machine.
+    "PyQt6>=6.6,<6.8",
+    "google-api-python-client>=2.100",
+    "google-auth-oauthlib>=1.2",
+    "google-auth-httplib2>=0.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+]
+
+[project.scripts]
+airplane-notifier = "airplanenotifier.main:main"
+
+[tool.setuptools.packages.find]
+include = ["airplanenotifier*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
