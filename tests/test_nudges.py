@@ -146,11 +146,14 @@ def test_acknowledging_clears_an_ignore_streak(build):
 
 def test_only_the_most_overdue_nudge_fires(build):
     """R30: never stack two characters on screen."""
+    # Food's time must be a real 12:30, not an arbitrary one: a fixed-time
+    # nudge whose next_due is not one of its configured times is now treated
+    # as corrupt and re-derived rather than fired.
     config.save_state({
-        "water": {"next_due": at(9, 50), "consecutive_ignores": 0},
-        "food": {"next_due": at(9, 10), "consecutive_ignores": 0},
+        "water": {"next_due": at(13, 10), "consecutive_ignores": 0},
+        "food": {"next_due": at(12, 30), "consecutive_ignores": 0},
     })
-    scheduler, recorder, _ = build(now=at(10))
+    scheduler, recorder, _ = build(now=at(13, 20))
 
     scheduler.tick()
 
@@ -161,9 +164,9 @@ def test_a_disabled_nudge_never_fires(build, config_dir):
     paths.CONFIG_PATH.write_text(json.dumps({"nudges": {"water": {"enabled": False}}}))
     config.save_state({
         "water": {"next_due": at(9), "consecutive_ignores": 0},
-        "food": {"next_due": at(9, 30), "consecutive_ignores": 0},
+        "food": {"next_due": at(12, 30), "consecutive_ignores": 0},
     })
-    scheduler, recorder, _ = build(now=at(10))
+    scheduler, recorder, _ = build(now=at(13))
 
     scheduler.tick()
 
@@ -441,3 +444,57 @@ def test_water_still_uses_an_interval(build):
     scheduler.tick()
     scheduler.resolve("water", ACKNOWLEDGED)
     assert config.load_state()["water"]["next_due"] == at(10) + timedelta(minutes=90)
+
+
+# --- a stored schedule must be a real one -----------------------------------
+
+
+def test_a_bogus_fixed_time_schedule_is_repaired_not_fired(build):
+    """The 22:00 lunch reminder.
+
+    A stray write to state.json (a test, a hand edit, a corrupted file) parked
+    food at 21:37. Lateness alone said "only just due", so it fired -- and
+    asked about lunch at nearly ten at night. A fixed-time nudge's next_due
+    must actually BE one of its configured times.
+    """
+    config.save_state({"food": {"next_due": at(21, 37), "consecutive_ignores": 0}})
+    scheduler, recorder, _ = build(now=at(21, 38))
+
+    scheduler.tick()
+
+    assert "food" not in recorder.types
+    # ...and it has been re-derived to a real 12:30, not left to fire again.
+    assert config.load_state()["food"]["next_due"] == at(12, 30, day=19)
+
+
+def test_a_backoff_re_ask_is_not_mistaken_for_a_bogus_schedule(build):
+    """Re-asks are deliberately off-schedule; repairing them would cancel them."""
+    config.save_state({"food": {"next_due": at(12, 45), "consecutive_ignores": 1}})
+    scheduler, recorder, _ = build(now=at(12, 46))
+
+    scheduler.tick()
+
+    assert recorder.types == ["food"]
+
+
+def test_changing_the_configured_time_re_derives_stored_state(build, config_dir):
+    """Editing 12:30 to 14:00 must not leave yesterday's 12:30 in state."""
+    paths.CONFIG_PATH.write_text(json.dumps(
+        {"nudges": {"food": {"enabled": True, "at": ["14:00"],
+                             "question": "Did you have lunch?"}}}))
+    config.save_state({"food": {"next_due": at(12, 30), "consecutive_ignores": 0}})
+    scheduler, _, _ = build(now=at(9))
+
+    scheduler.tick()
+
+    assert config.load_state()["food"]["next_due"] == at(14)
+
+
+def test_an_interval_nudge_is_never_touched_by_the_alignment_check(build):
+    """Water has no clock time to align to; its next_due is whatever it is."""
+    config.save_state({"water": {"next_due": at(10, 17), "consecutive_ignores": 0}})
+    scheduler, recorder, _ = build(now=at(10, 18))
+
+    scheduler.tick()
+
+    assert recorder.types == ["water"]

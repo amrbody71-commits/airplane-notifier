@@ -233,6 +233,31 @@ class NudgeScheduler:
         grace = timedelta(minutes=as_int(cfg.get("catch_up_minutes"), 120))
         return now - due > grace
 
+    def _is_aligned(self, settings: dict, entry: Optional[dict]) -> bool:
+        """Whether a fixed-time nudge's next_due is actually one of its times.
+
+        Lateness alone is not enough to judge a stored schedule. A next_due of
+        21:37 for a 12:30 lunch nudge looks perfectly fresh the moment it
+        arrives, so it fires -- and asks about lunch at nearly ten at night.
+        That is exactly what a stray write to state.json (a test, a hand edit,
+        a corrupted file) produces, and what changing "12:30" to another time
+        in config leaves behind.
+
+        An ignore-backoff re-ask is deliberately off-schedule, so a nudge
+        mid-backoff is left alone; those chains reset to a real clock time on
+        their own once the re-ask limit is reached.
+        """
+        times = self._fixed_times(settings)
+        if not times:
+            return True  # interval nudges have no clock time to align to
+        if int((entry or {}).get("consecutive_ignores", 0)) > 0:
+            return True  # a backoff re-ask, legitimately between slots
+        due = (entry or {}).get("next_due")
+        if due is None:
+            return False
+        local = due.astimezone()
+        return any(local.hour == t.hour and local.minute == t.minute for t in times)
+
     def _seed_missing(self, cfg: dict, state: dict, now: datetime) -> bool:
         """Give any unscheduled type a first due time. Returns True if changed."""
         changed = False
@@ -242,7 +267,11 @@ class NudgeScheduler:
             # A next_due absurdly far out is a clock-skew artefact: booting with
             # a wrong RTC once would otherwise park a nudge a year ahead and it
             # would never fire again, surviving every restart.
-            if due is not None and due - now <= _MAX_SANE_LEAD:
+            if (
+                due is not None
+                and due - now <= _MAX_SANE_LEAD
+                and self._is_aligned(settings, entry)
+            ):
                 continue
             state[nudge_type] = {
                 "next_due": self._next_due(settings, now),
