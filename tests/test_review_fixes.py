@@ -718,3 +718,64 @@ def test_the_five_minute_default_banner_is_unaffected_by_the_zero_case():
     from airplanenotifier.main import _banner_text
 
     assert _banner_text({"summary": "Standup", "lead_minutes": 5}) == "Standup"
+
+
+# --- a renamed calendar is still the same calendar ---------------------------
+
+# Google keeps two names for a subscribed calendar: `summary` is the feed's own
+# title (frequently its raw .ics URL) and `summaryOverride` is what the user
+# renamed it to. Only the override is ever visible in Google Calendar, so a
+# config rule naming a calendar will use that -- and matching only on `summary`
+# meant such a rule silently never matched.
+
+LECTURES = {
+    "id": "53fvr26@import.calendar.google.com",
+    "summary": "https://ical.studenthub.lse.ac.uk/ics/11468db/all-calendars/",
+    "summaryOverride": "Lectures",
+}
+
+
+def test_a_lead_rule_matches_the_name_the_user_actually_sees(config_dir):
+    client, _ = _lead_client({"Lectures": [60, 30]}, [LECTURES],
+                             {LECTURES["id"]: [_event_in(58)]})
+    assert [m["lead_minutes"] for m in client.get_upcoming_meetings(now=NOW)] == [60]
+
+
+def test_a_rule_keyed_to_the_underlying_feed_url_still_matches(config_dir):
+    """Renaming must not break a rule written before the rename."""
+    client, _ = _lead_client({"studenthub.lse.ac.uk": [60, 30]}, [LECTURES],
+                             {LECTURES["id"]: [_event_in(58)]})
+    assert [m["lead_minutes"] for m in client.get_upcoming_meetings(now=NOW)] == [60]
+
+
+def test_a_renamed_calendar_can_be_ignored_by_its_new_name(config_dir):
+    paths.CONFIG_PATH.write_text(json.dumps({"ignored_calendars": ["Lectures"]}))
+    client, service = _client_with_calendars(
+        [LECTURES, {"id": "primary", "summary": "me@example.com"}])
+
+    client.get_upcoming_meetings(now=NOW)
+
+    queried = {c.kwargs["calendarId"] for c in service.events.return_value.list.call_args_list}
+    assert queried == {"primary"}
+
+
+def test_diagnostics_show_the_users_name_not_the_feed_url(config_dir):
+    client, _ = _client_with_calendars([LECTURES])
+    client._calendar_ids(NOW)
+    assert client._calendar_names[LECTURES["id"]] == "Lectures"
+
+
+def test_a_rule_using_the_visible_name_is_not_reported_as_unmatched(config_dir):
+    """Otherwise the log would cry wolf about a rule that works perfectly."""
+    paths.CONFIG_PATH.write_text(json.dumps(
+        {"lead_times": {"default": [5], "by_calendar": {"Lectures": [60]}}}))
+    client, _ = _client_with_calendars([LECTURES])
+    client._calendar_ids(NOW)
+    assert client._last_unmatched == []
+
+
+def test_a_calendar_without_an_override_is_unaffected(config_dir):
+    plain = {"id": "prayer", "summary": "PrayerCal"}
+    client, _ = _client_with_calendars([plain])
+    client._calendar_ids(NOW)
+    assert client._calendar_names["prayer"] == "PrayerCal"

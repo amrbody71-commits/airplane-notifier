@@ -89,6 +89,7 @@ class CalendarClient:
         self._backoff_until: Optional[datetime] = None
         self._consecutive_failures = 0
         self._calendar_names: dict[str, str] = {}
+        self._calendar_aliases: dict[str, set] = {}
         self._last_unmatched: list[str] = []
         self._calendar_ids_cache: Optional[list[str]] = None
         self._calendar_list_fetched: Optional[datetime] = None
@@ -236,23 +237,46 @@ class CalendarClient:
             if str(name).strip()
         }
         ids = []
+        # A subscribed calendar has TWO names: `summary` is the feed's own
+        # title -- often its raw .ics URL -- and `summaryOverride` is what the
+        # user renamed it to, which is the only name they ever see. Display the
+        # override, but match against both, or a rule naming the calendar the
+        # way it appears in Google Calendar would silently never match.
         self._calendar_names = {
-            e["id"]: str(e.get("summary") or "") for e in entries if e.get("id")
+            e["id"]: self._display_name(e) for e in entries if e.get("id")
+        }
+        self._calendar_aliases = {
+            e["id"]: self._aliases(e) for e in entries if e.get("id")
         }
         self._warn_unmatched_rules(entries)
         for entry in entries:
             calendar_id = entry.get("id")
             if not calendar_id or entry.get("deleted"):
                 continue
-            # Match on either the id or the display name: the ids are opaque
-            # hashes, so a hand-edited config is far likelier to use the name.
-            summary = str(entry.get("summary") or "")
-            if {calendar_id.casefold(), summary.strip().casefold()} & ignored:
+            # Match on the id or on either name: the ids are opaque hashes, so
+            # a hand-edited config is far likelier to use whatever name the
+            # user sees in Google Calendar.
+            if self._aliases(entry) & ignored:
                 continue
             ids.append(calendar_id)
         self._calendar_ids_cache = ids or ["primary"]
         self._calendar_list_fetched = moment
         return self._calendar_ids_cache
+
+    @staticmethod
+    def _display_name(entry: dict) -> str:
+        """The name the user sees: their override if set, else the feed's own."""
+        return str(entry.get("summaryOverride") or entry.get("summary") or "")
+
+    @staticmethod
+    def _aliases(entry: dict) -> set:
+        """Every string that may legitimately identify this calendar."""
+        candidates = (
+            entry.get("id"),
+            entry.get("summary"),
+            entry.get("summaryOverride"),
+        )
+        return {str(c).strip().casefold() for c in candidates if c}
 
     @staticmethod
     def _rfc3339(moment: datetime) -> str:
@@ -269,10 +293,7 @@ class CalendarClient:
         cfg = config.load_config()
         known = set()
         for entry in entries:
-            if entry.get("id"):
-                known.add(str(entry["id"]).casefold())
-            if entry.get("summary"):
-                known.add(str(entry["summary"]).strip().casefold())
+            known |= self._aliases(entry)
 
         def matches(probe: str) -> bool:
             probe = probe.strip().casefold()
@@ -306,12 +327,18 @@ class CalendarClient:
         by_calendar = section.get("by_calendar")
         chosen = None
         if isinstance(by_calendar, dict):
-            name = (calendar_name or "").casefold()
+            # Every way this calendar can be named, so a rule keyed to the
+            # user-visible name and one keyed to the underlying feed URL both
+            # resolve to the same calendar.
+            aliases = self._calendar_aliases.get(calendar_id) or {
+                calendar_id.casefold(), (calendar_name or "").strip().casefold()
+            }
+            aliases = {a for a in aliases if a}
             for key, leads in by_calendar.items():
                 probe = str(key).strip().casefold()
                 if not probe:
                     continue
-                if probe == calendar_id.casefold() or probe == name or probe in name:
+                if probe in aliases or any(probe in a for a in aliases):
                     chosen = leads
                     break
         if chosen is None:
